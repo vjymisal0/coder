@@ -1,5 +1,6 @@
 import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { HttpResponse, http } from "msw";
 import { defaultScheduler, notifyManager } from "react-query";
 import { Outlet } from "react-router";
 import {
@@ -22,6 +23,9 @@ import {
 	MockChatDiffStatus,
 	MockChatMessage,
 	MockChatQueuedMessage,
+	MockOpenPreviewResult,
+	MockPreviewAddressResponse,
+	MockPreviewSignInResponse,
 } from "#/testHelpers/chatEntities";
 import {
 	MockChatModel,
@@ -29,10 +33,14 @@ import {
 } from "#/testHelpers/chatModels";
 import { createDeferred } from "#/testHelpers/deferred";
 import {
+	MockUserMember,
 	MockUserPreferenceSettings,
+	MockWorkspace,
+	MockWorkspaceAgent,
 	mockApiError,
 } from "#/testHelpers/entities";
 import { renderWithAuth } from "#/testHelpers/renderHelpers";
+import { server } from "#/testHelpers/server";
 import { MockSkill } from "#/testHelpers/skills";
 import {
 	createMockWebSocket,
@@ -40,8 +48,16 @@ import {
 } from "#/testHelpers/websockets";
 import { OneWayWebSocket } from "#/utils/OneWayWebSocket";
 import type { AgentsPageOutletContext } from "../AgentsPageLayout";
+import { RIGHT_PANEL_OPEN_KEY } from "../components/RightPanel/RightPanel";
 import { parseStoredDraft } from "../utils/draftStorage";
 import { overviewCardOpenStorageKey } from "../utils/overviewCardStorage";
+import {
+	getPersistedRightPanelTabs,
+	savePersistedDefaultTerminalHidden,
+	savePersistedRightPanelTabs,
+} from "../utils/rightPanelTabStorage";
+import type { NewPreviewTab } from "../utils/rightPanelTabs";
+import { getPersistedSidebarTabId } from "../utils/sidebarTabStorage";
 import AgentChatPage from "./AgentChatPage";
 
 const mockProjectChat = { ...MockChat, project_id: "project-1" };
@@ -675,5 +691,301 @@ describe("AgentChatPage", () => {
 		// The row is listed again, so it can be promoted again.
 		await user.click(screen.getByRole("button", { name: "Send now" }));
 		await waitFor(() => expect(promote).toHaveBeenCalledTimes(2));
+	});
+
+	describe("open_preview results", () => {
+		const mockPreviewChat: Chat = {
+			...MockChat,
+			workspace_id: MockWorkspace.id,
+			agent_id: MockWorkspaceAgent.id,
+		};
+
+		const previewExchange = (
+			id: number,
+			result: { title: string } & Record<string, unknown>,
+		): TypesGen.ChatMessage[] => [
+			{
+				...MockChatMessage,
+				chat_id: mockPreviewChat.id,
+				id,
+				role: "assistant",
+				content: [
+					{
+						type: "tool-call",
+						tool_call_id: `call-${id}`,
+						tool_name: "open_preview",
+						args: { title: result.title },
+					},
+				],
+			},
+			{
+				...MockChatMessage,
+				chat_id: mockPreviewChat.id,
+				id: id + 1,
+				role: "tool",
+				content: [
+					{
+						type: "tool-result",
+						tool_call_id: `call-${id}`,
+						tool_name: "open_preview",
+						result,
+					},
+				],
+			},
+		];
+
+		const renderPreviewChat = ({
+			messages = [],
+			chat = mockPreviewChat,
+			workspace = MockWorkspace,
+			experiments = ["open-preview"],
+		}: {
+			messages?: readonly TypesGen.ChatMessage[];
+			chat?: Chat;
+			workspace?: TypesGen.Workspace;
+			experiments?: readonly string[];
+		}) => {
+			server.use(
+				http.get("/api/v2/experiments", () => HttpResponse.json(experiments)),
+			);
+			mockChatPageApi(chat);
+			vi.spyOn(API.experimental, "getChatMessages").mockResolvedValue({
+				messages: [...messages],
+				queued_messages: [],
+				has_more: false,
+				snapshot_version: 1,
+			});
+			vi.spyOn(API, "getWorkspace").mockResolvedValue(workspace);
+			vi.spyOn(apiModule, "watchWorkspace").mockImplementation(
+				() =>
+					new OneWayWebSocket({
+						apiRoute: `/api/v2/workspaces/${MockWorkspace.id}/watch-ws`,
+						websocketInit: (url, protocol) =>
+							createMockWebSocket(url, protocol)[0],
+					}),
+			);
+			const getAddress = vi
+				.spyOn(API.experimental, "getPreviewAddress")
+				.mockResolvedValue(MockPreviewAddressResponse);
+			const signIn = vi
+				.spyOn(API.experimental, "signInToPreview")
+				.mockResolvedValue(MockPreviewSignInResponse);
+			savePersistedDefaultTerminalHidden(chat.id, true);
+			renderChatPage(chat);
+			return { user: userEvent.setup(), getAddress, signIn };
+		};
+
+		// The dashboard's frame for a preview tab, which a reload replaces.
+		const previewFrame = (label: string) =>
+			within(screen.getByRole("tabpanel", { name: label })).getByTitle(label);
+
+		it("opens a result's tab from its row once", async () => {
+			const tab: NewPreviewTab = {
+				kind: "preview",
+				label: MockOpenPreviewResult.title,
+				workspaceId: MockWorkspace.id,
+				agentName: MockWorkspaceAgent.name,
+				slug: MockOpenPreviewResult.preview_slug,
+				urlPath: "/docs?page=2",
+			};
+			const page = renderPreviewChat({
+				messages: previewExchange(10, {
+					...MockOpenPreviewResult,
+					url_path: "/docs?page=2",
+				}),
+			});
+			const openButton = await screen.findByRole("button", {
+				name: "Open preview",
+			});
+
+			await page.user.click(openButton);
+			await page.user.click(openButton);
+
+			await waitFor(() =>
+				expect(getPersistedRightPanelTabs(mockPreviewChat.id)).toEqual([
+					expect.objectContaining(tab),
+				]),
+			);
+			expect(getPersistedSidebarTabId(mockPreviewChat.id)).toBe(
+				getPersistedRightPanelTabs(mockPreviewChat.id)[0]?.id,
+			);
+			expect(screen.getByRole("tab", { name: tab.label })).toHaveFocus();
+			await waitFor(() => expect(page.getAddress).toHaveBeenCalled());
+			// The frame loads with the browser's preview session and signs in
+			// only if the preview host asks.
+			expect(page.signIn).not.toHaveBeenCalled();
+		});
+
+		it("renames an open preview's tab and reloads it for a newer result", async () => {
+			const page = renderPreviewChat({
+				messages: [
+					...previewExchange(10, MockOpenPreviewResult),
+					...previewExchange(12, {
+						...MockOpenPreviewResult,
+						title: "Docs v2",
+					}),
+				],
+			});
+			const [firstButton, newerButton] = await screen.findAllByRole("button", {
+				name: "Open preview",
+			});
+			await page.user.click(firstButton);
+			const firstFrame = await waitFor(() => previewFrame("Docs site"));
+
+			await page.user.click(newerButton);
+
+			await waitFor(() =>
+				expect(getPersistedRightPanelTabs(mockPreviewChat.id)).toEqual([
+					expect.objectContaining({ kind: "preview", label: "Docs v2" }),
+				]),
+			);
+			const newerFrame = await waitFor(() => previewFrame("Docs v2"));
+			expect(newerFrame).not.toBe(firstFrame);
+			expect(firstFrame).not.toBeInTheDocument();
+
+			// Opening the same result again reloads it too.
+			await page.user.click(newerButton);
+			await waitFor(() => expect(newerFrame).not.toBeInTheDocument());
+			expect(previewFrame("Docs v2")).not.toBe(newerFrame);
+			expect(page.signIn).not.toHaveBeenCalled();
+		});
+
+		it("offers no preview while the experiment is off", async () => {
+			const page = renderPreviewChat({
+				experiments: [],
+				messages: previewExchange(10, MockOpenPreviewResult),
+			});
+			await screen.findByText(MockOpenPreviewResult.title);
+			// The row settles once the chat's workspace loads, which is when
+			// the owner would get the button.
+			await waitFor(() => expect(API.getWorkspace).toHaveBeenCalled());
+
+			for (const button of screen.queryAllByRole("button", {
+				name: "Open preview",
+			})) {
+				await page.user.click(button);
+			}
+
+			expect(getPersistedRightPanelTabs(mockPreviewChat.id)).toEqual([]);
+			expect(page.getAddress).not.toHaveBeenCalled();
+			expect(page.signIn).not.toHaveBeenCalled();
+		});
+
+		it("offers no preview of another workspace or agent to the owner", async () => {
+			const page = renderPreviewChat({
+				messages: [
+					...previewExchange(10, {
+						...MockOpenPreviewResult,
+						workspace_id: "other-workspace",
+					}),
+					...previewExchange(12, {
+						...MockOpenPreviewResult,
+						agent_name: "other-agent",
+					}),
+				],
+			});
+			// Both rows settle once the chat's workspace and agent load.
+			await screen.findAllByText(
+				"This preview belongs to a different workspace.",
+			);
+
+			for (const button of screen.queryAllByRole("button", {
+				name: "Open preview",
+			})) {
+				await page.user.click(button);
+			}
+
+			expect(getPersistedRightPanelTabs(mockPreviewChat.id)).toEqual([]);
+			expect(page.getAddress).not.toHaveBeenCalled();
+			expect(page.signIn).not.toHaveBeenCalled();
+		});
+
+		it.each([
+			{ viewer: "a user the workspace is shared with", chat: mockPreviewChat },
+			{
+				viewer: "a reader of another user's shared chat",
+				chat: { ...mockPreviewChat, owner_id: MockUserMember.id },
+			},
+		])("does not open previews for $viewer", async ({ chat }) => {
+			const page = renderPreviewChat({
+				chat,
+				workspace: { ...MockWorkspace, owner_id: MockUserMember.id },
+				messages: [
+					...previewExchange(10, MockOpenPreviewResult),
+					...previewExchange(12, {
+						...MockOpenPreviewResult,
+						workspace_id: "other-workspace",
+					}),
+				],
+			});
+			// The other workspace's row settles once the chat's workspace loads,
+			// whoever views it, so the owner check has run by then.
+			await screen.findByText("This preview belongs to a different workspace.");
+
+			for (const button of screen.queryAllByRole("button", {
+				name: "Open preview",
+			})) {
+				await page.user.click(button);
+			}
+
+			expect(getPersistedRightPanelTabs(chat.id)).toEqual([]);
+			expect(page.getAddress).not.toHaveBeenCalled();
+			expect(page.signIn).not.toHaveBeenCalled();
+		});
+
+		it("opens the same preview at another URL path in its own tab", async () => {
+			const page = renderPreviewChat({
+				messages: [
+					...previewExchange(10, MockOpenPreviewResult),
+					...previewExchange(12, {
+						...MockOpenPreviewResult,
+						url_path: "/admin",
+					}),
+				],
+			});
+			const [rootButton, adminButton] = await screen.findAllByRole("button", {
+				name: "Open preview",
+			});
+
+			await page.user.click(rootButton);
+			await page.user.click(adminButton);
+
+			await waitFor(() =>
+				expect(
+					getPersistedRightPanelTabs(mockPreviewChat.id).map((tab) =>
+						tab.kind === "preview" ? tab.urlPath : tab.kind,
+					),
+				).toEqual([undefined, "/admin"]),
+			);
+		});
+
+		it("loads a restored preview tab once it is shown", async () => {
+			localStorage.setItem(RIGHT_PANEL_OPEN_KEY, "true");
+			savePersistedRightPanelTabs(mockPreviewChat.id, [
+				{
+					id: "preview-docs",
+					kind: "preview",
+					label: "Docs site",
+					workspaceId: MockWorkspace.id,
+					agentName: MockWorkspaceAgent.name,
+					slug: "preview--3000",
+					urlPath: "/docs",
+				},
+			]);
+			const page = renderPreviewChat({});
+			const previewTab = await screen.findByRole("tab", { name: "Docs site" });
+			expect(page.getAddress).not.toHaveBeenCalled();
+
+			await page.user.click(previewTab);
+			await waitFor(() => previewFrame("Docs site"));
+			expect(page.getAddress).toHaveBeenCalledWith(
+				expect.objectContaining({
+					workspace_id: MockWorkspace.id,
+					agent_name: MockWorkspaceAgent.name,
+					preview_slug: "preview--3000",
+					url_path: "/docs",
+				}),
+			);
+		});
 	});
 });
